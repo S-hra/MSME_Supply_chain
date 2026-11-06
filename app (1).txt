@@ -1,0 +1,450 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import networkx as nx
+import plotly.express as px
+import plotly.graph_objects as go
+import pickle
+import os
+import sys
+sys.path.append(r"C:\Users\DELL\supply_chain_project")
+
+st.set_page_config(
+    page_title="MSME Supply Chain Intelligence",
+    page_icon="🏭",
+    layout="wide"
+)
+
+PATH = r"C:\Users\DELL\supply_chain_project\data"
+
+# ── Load all data ─────────────────────────────────────────────────────────────
+@st.cache_data
+def load_all():
+    scores  = pd.read_csv(f"{PATH}/msme_resilience_scores_v2.csv")
+    news    = pd.read_csv(f"{PATH}/news_final_labelled.csv")
+    summary = pd.read_csv(f"{PATH}/msme_sector_summary.csv")
+    gnn     = pd.read_csv(f"{PATH}/gnn_node_risk_scores.csv")
+    return scores, news, summary, gnn
+
+@st.cache_resource
+def load_graph():
+    return nx.read_gexf(f"{PATH}/msme_graph.gexf")
+
+@st.cache_resource
+def load_nlp():
+    model = pickle.load(open(f"{PATH}/nlp_model.pkl", "rb"))
+    tfidf = pickle.load(open(f"{PATH}/tfidf_vectorizer.pkl", "rb"))
+    return model, tfidf
+
+scores, news, summary, gnn = load_all()
+G = load_graph()
+nlp_model, tfidf = load_nlp()
+
+def risk_color(score):
+    if score < 30:   return "#dc2626"
+    elif score < 50: return "#ea580c"
+    elif score < 70: return "#ca8a04"
+    else:            return "#16a34a"
+
+def risk_label(score):
+    if score < 30:   return "🔴 Critical"
+    elif score < 50: return "🟠 High"
+    elif score < 70: return "🟡 Medium"
+    else:            return "🟢 Low"
+
+# ── Dynamic state/sector vocabulary for headline matching ──────────────────────
+# Built from your actual data instead of hardcoded, so it stays correct if the
+# dataset grows. Sorted longest-first so "Uttar Pradesh" matches before "Pradesh".
+ALL_STATES  = sorted(scores["State"].unique(), key=len, reverse=True)
+ALL_SECTORS = sorted(scores["Sector"].unique(), key=len, reverse=True)
+
+def detect_affected_nodes(headline: str):
+    """
+    Scan a headline for any known state and/or sector name.
+    Returns a list of matching graph node IDs ('STATE_Sector' format).
+    - If both a state AND a sector are found -> exactly one node (that cluster).
+    - If only a state is found -> every node in that state.
+    - If only a sector is found -> every node in that sector.
+    - If neither is found -> empty list.
+    """
+    text = headline.upper()
+
+    matched_state = next((s for s in ALL_STATES if s.upper() in text), None)
+    matched_sector = next((sec for sec in ALL_SECTORS if sec.upper() in text), None)
+
+    if matched_state and matched_sector:
+        node_id = f"{matched_state}_{matched_sector}"
+        return [node_id] if node_id in G.nodes() else []
+    elif matched_state:
+        return [n for n in G.nodes() if n.startswith(f"{matched_state}_")]
+    elif matched_sector:
+        return [n for n in G.nodes() if n.endswith(f"_{matched_sector}")]
+    else:
+        return []
+
+# ── Session state init (do this ONCE, before any tab renders) ──────────────────
+if "highlighted_nodes" not in st.session_state:
+    st.session_state.highlighted_nodes = []      # list of node IDs to highlight
+if "highlight_source" not in st.session_state:
+    st.session_state.highlight_source = None     # the headline that caused it
+
+# ── HEADER ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<h1 style='text-align:center;color:#1a1a2e'>
+🏭 MSME Supply Chain Intelligence Dashboard
+</h1>
+<p style='text-align:center;color:#6b7280'>
+AI-Powered Disruption Detection & Resilience Scoring — Indian MSME Networks
+</p>
+""", unsafe_allow_html=True)
+
+# ── TOP METRICS ───────────────────────────────────────────────────────────────
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Total MSMEs", "3.6 Million")
+col2.metric("Cities Covered", "8")
+col3.metric("MSME Clusters", "186")
+col4.metric("NLP Accuracy", "96%")
+col5.metric("GNN Accuracy", "95.95%")
+
+st.markdown("---")
+
+# ── TABS ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🗺️ Supply Chain Network",
+    "📊 Resilience Scores",
+    "📰 News Classifier",
+    "🤖 GNN Risk Analysis",
+    "💬 AI Chatbot"
+])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Supply Chain Network
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.subheader("Supply Chain Network — Indian MSME Clusters")
+
+    if st.session_state.highlighted_nodes:
+        st.info(
+            f"📍 Showing {len(st.session_state.highlighted_nodes)} cluster(s) affected by: "
+            f"\"{st.session_state.highlight_source}\""
+        )
+        if st.button("Clear highlight, show full network"):
+            st.session_state.highlighted_nodes = []
+            st.session_state.highlight_source = None
+            st.rerun()
+    else:
+        st.write("Each node = one State-Sector MSME cluster. Edges = supply dependencies. "
+                 "Enter a headline in the News Classifier tab to highlight affected clusters here.")
+
+    score_dict = dict(zip(scores["Node"], scores["Resilience_Score_v2"]))
+
+    nodes_list = list(G.nodes())
+    edges_list = list(G.edges())
+
+    highlighted = set(st.session_state.highlighted_nodes)
+
+    if highlighted:
+        # Show ONLY the affected cluster(s) — plus their direct suppliers/buyers
+        # for context, if any real edges exist. Everything else is left out of
+        # the view entirely, instead of being drawn dim in the background.
+        neighbors = set()
+        for n in highlighted:
+            if G.has_node(n):
+                neighbors.update(G.predecessors(n))
+                neighbors.update(G.successors(n))
+        display_node_set = highlighted | neighbors
+        display_nodes = [n for n in nodes_list if n in display_node_set]
+        display_edges = [(s, d) for s, d in edges_list
+                          if s in display_node_set and d in display_node_set]
+
+        sub_pos = nx.spring_layout(G.subgraph(display_node_set), seed=42, k=1.5)
+    else:
+        display_nodes = nodes_list
+        display_edges = edges_list
+        sub_pos = nx.spring_layout(G, seed=42, k=3)
+
+    edge_x, edge_y = [], []
+    for src, dst in display_edges:
+        x0, y0 = sub_pos[src]
+        x1, y1 = sub_pos[dst]
+        edge_x += [x0, x1, None]
+        edge_y += [y0, y1, None]
+
+    edge_trace = go.Scatter(x=edge_x, y=edge_y,
+        line=dict(width=1.5, color="#9ca3af"),
+        hoverinfo="none", mode="lines")
+
+    node_x = [sub_pos[n][0] for n in display_nodes]
+    node_y = [sub_pos[n][1] for n in display_nodes]
+
+    if highlighted:
+        # The matched cluster(s) get a bold outline; any supplier/buyer neighbors
+        # shown for context are drawn smaller and unoutlined so the match stands out.
+        node_colors = [risk_color(score_dict.get(n, 60)) for n in display_nodes]
+        node_sizes = [
+            (35 + min(25, G.nodes[n].get("msme_count", 1000)/5000)) if n in highlighted
+            else (18 + min(15, G.nodes[n].get("msme_count", 1000)/6000))
+            for n in display_nodes
+        ]
+        node_line_widths = [3 if n in highlighted else 1 for n in display_nodes]
+        node_line_colors = ["#1a1a2e" if n in highlighted else "white" for n in display_nodes]
+        node_opacities = [1.0 for _ in display_nodes]
+    else:
+        node_colors = [risk_color(score_dict.get(n, 60)) for n in display_nodes]
+        node_sizes  = [20 + min(30, G.nodes[n].get("msme_count", 1000)/5000)
+                       for n in display_nodes]
+        node_line_widths = [1 for _ in display_nodes]
+        node_line_colors = ["white" for _ in display_nodes]
+        node_opacities = [1.0 for _ in display_nodes]
+
+    node_text = [f"{n}<br>Score: {score_dict.get(n, 60):.1f}<br>{risk_label(score_dict.get(n, 60))}"
+                 for n in display_nodes]
+
+    # Full graph (186 nodes) -> labels off, hover only, or it's unreadable.
+    # Filtered view (a few nodes) -> labels are fine to show permanently.
+    if highlighted:
+        node_labels = [n.split("_")[-1] for n in display_nodes]
+        display_mode = "markers+text"
+    else:
+        node_labels = ["" for _ in display_nodes]
+        display_mode = "markers"
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode=display_mode,
+        hoverinfo="text",
+        hovertext=node_text,
+        text=node_labels,
+        textposition="top center",
+        textfont=dict(size=9),
+        opacity=1.0,
+        marker=dict(
+            size=node_sizes,
+            color=node_colors,
+            opacity=node_opacities,
+            line=dict(width=node_line_widths, color=node_line_colors)
+        )
+    )
+
+    fig_net = go.Figure(data=[edge_trace, node_trace],
+        layout=go.Layout(
+            showlegend=False,
+            hovermode="closest",
+            margin=dict(b=0, l=0, r=0, t=0),
+            height=500,
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            paper_bgcolor="white", plot_bgcolor="#f9fafb"
+        )
+    )
+    st.plotly_chart(fig_net, use_container_width=True)
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.markdown("🔴 Critical (0-30)")
+    col_b.markdown("🟠 High (30-50)")
+    col_c.markdown("🟡 Medium (50-70)")
+    col_d.markdown("🟢 Low (70-100)")
+
+    if highlighted:
+        st.markdown("**Affected clusters — detail:**")
+        detail = scores[scores["Node"].isin(highlighted)][
+            ["Node", "State", "Sector", "MSME_Count", "Resilience_Score_v2"]
+        ].copy()
+        detail["Risk"] = detail["Resilience_Score_v2"].apply(risk_label)
+        st.dataframe(detail, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Resilience Scores
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("MSME Cluster Resilience Scores")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        selected_states = st.multiselect("Filter by State",
+            options=sorted(scores["State"].unique()),
+            default=sorted(scores["State"].unique()))
+    with col_f2:
+        score_range = st.slider("Score range", 0, 100, (0, 100))
+
+    filtered = scores[
+        (scores["State"].isin(selected_states)) &
+        (scores["Resilience_Score_v2"].between(score_range[0], score_range[1]))
+    ].copy()
+    filtered["Risk"] = filtered["Resilience_Score_v2"].apply(risk_label)
+    filtered["Color"] = filtered["Resilience_Score_v2"].apply(risk_color)
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Clusters shown", len(filtered))
+    col_m2.metric("Critical risk", (filtered["Resilience_Score_v2"] < 30).sum())
+    col_m3.metric("Avg score", f"{filtered['Resilience_Score_v2'].mean():.1f}")
+
+    top15 = filtered.nsmallest(15, "Resilience_Score_v2")
+    top15["Label"] = top15["State"] + " — " + top15["Sector"]
+    fig_bar = px.bar(top15, x="Resilience_Score_v2", y="Label",
+        orientation="h",
+        color="Resilience_Score_v2",
+        color_continuous_scale=["#dc2626","#ea580c","#ca8a04","#16a34a"],
+        range_color=[0,100],
+        title="Top 15 Most Vulnerable MSME Clusters")
+    fig_bar.add_vline(x=50, line_dash="dash", line_color="gray",
+                      annotation_text="Risk threshold")
+    fig_bar.update_layout(height=450, yaxis={"autorange":"reversed"},
+                          coloraxis_showscale=False)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.dataframe(
+        filtered[["State","Sector","MSME_Count","Resilience_Score",
+                  "Resilience_Score_v2","Risk"]].sort_values("Resilience_Score_v2"),
+        use_container_width=True, height=300
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — News Classifier  (this is where the graph highlight gets triggered)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.subheader("Live News Disruption Classifier")
+    st.write("Type any news headline. If it's classified as a disruption and mentions "
+             "a known state and/or sector, the network graph in Tab 1 will highlight "
+             "the affected cluster(s).")
+
+    headline = st.text_input("Enter a news headline:",
+        placeholder="e.g. Truckers strike disrupts supply chain in Gujarat",
+        key="headline_input")
+
+    if headline:
+        vec  = tfidf.transform([headline])
+        pred = nlp_model.predict(vec)[0]
+        prob = nlp_model.predict_proba(vec)[0][pred]
+
+        affected = detect_affected_nodes(headline)
+
+        if pred == 1:
+            st.error(f"🚨 DISRUPTION DETECTED — Confidence: {prob*100:.1f}%")
+            if affected:
+                st.success(f"📍 Matched {len(affected)} cluster(s): {', '.join(affected)}")
+                # Only update + rerun if this is actually a NEW result, to avoid a rerun loop
+                if (st.session_state.highlighted_nodes != affected
+                        or st.session_state.highlight_source != headline):
+                    st.session_state.highlighted_nodes = affected
+                    st.session_state.highlight_source = headline
+                    st.rerun()
+                st.info("✅ Check Tab 1 — the affected cluster(s) are now highlighted.")
+            else:
+                st.warning("Disruption detected, but no known state/sector name found in "
+                           "this headline, so nothing can be highlighted on the graph. "
+                           "Try including a state or sector name explicitly.")
+        else:
+            st.success(f"✅ NORMAL NEWS — Confidence: {prob*100:.1f}%")
+
+    st.markdown("---")
+    st.subheader("Recent News Dataset")
+    col_n1, col_n2 = st.columns(2)
+    col_n1.metric("Total articles", len(news))
+    col_n2.metric("Disruption articles", news["is_disruption"].sum())
+
+    show_disruption = st.checkbox("Show disruption articles only", value=True)
+    if show_disruption:
+        display_news = news[news["is_disruption"]==1]
+    else:
+        display_news = news
+
+    st.dataframe(
+        display_news[["title","source","pub_date","is_disruption"]].head(50),
+        use_container_width=True, height=300
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — GNN Risk Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.subheader("Graph Neural Network — Risk Analysis")
+
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown("**Top 10 Highest Risk Nodes (GNN)**")
+        top_risk = gnn.nlargest(10, "gnn_risk_score")[
+            ["node_id","state","sector","gnn_risk_score"]
+        ].reset_index(drop=True)
+        st.dataframe(top_risk, use_container_width=True)
+
+    with col_g2:
+        st.markdown("**GNN Risk Score Distribution**")
+        fig_gnn = px.histogram(gnn, x="gnn_risk_score", nbins=20,
+            color_discrete_sequence=["#D85A30"],
+            title="GNN Risk Score Distribution")
+        fig_gnn.add_vline(x=50, line_dash="dash", line_color="red",
+                          annotation_text="Risk threshold (50)")
+        fig_gnn.update_layout(height=350)
+        st.plotly_chart(fig_gnn, use_container_width=True)
+
+    st.markdown("**GNN Training Results**")
+    col_r1, col_r2, col_r3 = st.columns(3)
+    col_r1.metric("Training Accuracy", "95.95%")
+    col_r2.metric("Highest Risk Node", "West Bengal Food Processing")
+    col_r3.metric("GNN Risk Score", "98.43")
+
+    try:
+        from PIL import Image
+        img = Image.open(f"{PATH}/gnn_evaluation.png")
+        st.image(img, caption="GNN Evaluation Charts", use_column_width=True)
+    except Exception:
+        st.info("GNN evaluation chart: gnn_evaluation.png")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — AI Chatbot
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("💬 AI Chatbot — Ask About Your Supply Chain Data")
+    st.write("Ask any question about the MSME supply chain project data.")
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "groq_history" not in st.session_state:
+        st.session_state.groq_history = []
+
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            st.markdown(f"**You:** {msg['content']}")
+        else:
+            st.markdown(f"**AI:** {msg['content']}")
+
+    st.markdown("**Suggested questions:**")
+    col_q1, col_q2, col_q3 = st.columns(3)
+    user_q = None
+    if col_q1.button("Most at-risk cluster?"):
+        user_q = "Which MSME cluster is the most at risk?"
+    elif col_q2.button("West Bengal status?"):
+        user_q = "What is the resilience score of West Bengal Food Processing?"
+    elif col_q3.button("Recent disruptions?"):
+        user_q = "What disruption news was found in the project?"
+
+    user_input = st.text_input("Or type your question:", key="chat_input")
+    if user_input:
+        user_q = user_input
+
+    if user_q:
+        try:
+            from chatbot import ask_chatbot, knowledge_base
+            answer, st.session_state.groq_history = ask_chatbot(
+                user_q, st.session_state.groq_history
+            )
+            st.session_state.chat_history.append({"role":"user","content":user_q})
+            st.session_state.chat_history.append({"role":"assistant","content":answer})
+            st.rerun()
+        except Exception as e:
+            st.error(f"Chatbot error: {e}")
+            st.info("Make sure chatbot.py is saved and your Groq API key is set correctly.")
+
+    if st.button("Clear chat"):
+        st.session_state.chat_history = []
+        st.session_state.groq_history = []
+        st.rerun()
+
+st.markdown("---")
+st.markdown(
+    "<p style='text-align:center;color:#9ca3af;font-size:12px'>"
+    "AI-Powered Supply Chain Disruption Detection | Indian MSME Networks | "
+    "Symbiosis Institute of Geoinformatics</p>",
+    unsafe_allow_html=True
+)

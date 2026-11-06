@@ -1,0 +1,17 @@
+
+import os, warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.metrics import classification_report, confusion_matrix
+
+PATH = r"C:\\Users\\DELL\\supply_chain_project\\data"
+
+G = nx.read_gexf(os.path.join(PATH, "msme_graph.gexf"))
+scores = pd.read_csv(os.path.join(PATH, "msme_resilience_scores.csv"))
+print("Graph nodes:", G.number_of_nodes())
+print("Graph edges:", G.number_of_edges())

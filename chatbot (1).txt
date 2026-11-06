@@ -1,0 +1,37 @@
+
+import pandas as pd
+from groq import Groq
+
+PATH = r"C:\\Users\\DELL\\supply_chain_project\\data"
+GROQ_API_KEY = "Enter_your_key"
+
+def load_knowledge_base():
+    scores = pd.read_csv(f"{PATH}/msme_resilience_scores_v2.csv")
+    news   = pd.read_csv(f"{PATH}/news_final_labelled.csv")
+    gnn    = pd.read_csv(f"{PATH}/gnn_node_risk_scores.csv")
+    kb = ["PROJECT SUMMARY: AI-Powered Supply Chain project covering 3.6M MSMEs across 8 Indian cities. Graph 186 nodes 15 edges. NLP accuracy 96 percent. GNN accuracy 95.95 percent. Most at-risk West Bengal Food Processing GNN score 98.43."]
+    for _, row in scores.iterrows():
+        kb.append(f"Node: {row['Node']} State: {row['State']} Sector: {row['Sector']} Score: {row['Resilience_Score_v2']} Risk: {'CRITICAL' if row['Resilience_Score_v2'] < 30 else 'HIGH' if row['Resilience_Score_v2'] < 50 else 'MEDIUM' if row['Resilience_Score_v2'] < 70 else 'LOW'}")
+    for _, row in news[news['is_disruption']==1].head(20).iterrows():
+        kb.append(f"Disruption News: {row['title']}")
+    return kb
+
+knowledge_base = load_knowledge_base()
+client = Groq(api_key=GROQ_API_KEY)
+
+def ask_chatbot(question, history=[]):
+    relevant = [c for c in knowledge_base if any(w in c.lower() for w in question.lower().split() if len(w)>3)][:15]
+    relevant.append(knowledge_base[0])
+    context = "\n".join(relevant)
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": f"You are an AI assistant for Indian MSME Supply Chain project. Use this data: {context}. Be specific with numbers. Keep answers short."},
+            {"role": "user", "content": question}
+        ],
+        max_tokens=300, temperature=0.3
+    )
+    answer = response.choices[0].message.content
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": answer})
+    return answer, history

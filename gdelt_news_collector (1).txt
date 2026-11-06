@@ -1,0 +1,162 @@
+"""
+GDELT News Collector — Indian MSME Supply Chain Disruptions
+============================================================
+Pulls real, authentic news articles from GDELT DOC 2.0 API
+covering all 6 disruption types for Indian MSMEs.
+
+HOW TO RUN:
+    pip install requests pandas
+    python gdelt_news_collector.py
+
+OUTPUT:
+    gdelt_india_disruptions.csv  — clean, labelled dataset ready for NLP
+"""
+
+import requests
+import pandas as pd
+import time
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+START_DATE  = "20220101000000"
+END_DATE    = "20260101000000"
+MAX_RECORDS = 250
+SLEEP_SEC   = 15          # 15s between queries — safe for GDELT
+OUTPUT_FILE = "gdelt_india_disruptions.csv"
+
+# ─────────────────────────────────────────────
+# YOUR 6 DISRUPTION TYPES + QUERIES
+# ─────────────────────────────────────────────
+QUERIES = [
+    {
+        "disruption_type": "raw_material_shortage",
+        "label": "Raw Material Shortage",
+        "query": '"raw material" shortage India supply'
+    },
+    {
+        "disruption_type": "transport_disruption",
+        "label": "Transport Disruption",
+        "query": 'truckers strike halt India logistics'
+    },
+    {
+        "disruption_type": "natural_disaster",
+        "label": "Natural Disaster",
+        "query": 'flood cyclone factory damage India manufacturing'
+    },
+    {
+        "disruption_type": "policy_shock",
+        "label": "Policy Shock",
+        "query": '"export ban" India MSME manufacturing'
+    },
+    {
+        "disruption_type": "factory_shutdown",
+        "label": "Factory Shutdown",
+        "query": 'factory shutdown closed India manufacturing'
+    },
+    {
+        "disruption_type": "port_logistics_delay",
+        "label": "Port / Logistics Delay",
+        "query": 'port cargo delay congestion India Mumbai'
+    },
+]
+
+# ─────────────────────────────────────────────
+# GDELT API CALLER WITH RETRY
+# ─────────────────────────────────────────────
+BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+def fetch_gdelt(query_info):
+    params = {
+        "query"         : query_info["query"] + " sourcecountry:india tone<-1",
+        "mode"          : "artlist",
+        "maxrecords"    : MAX_RECORDS,
+        "format"        : "json",
+        "startdatetime" : START_DATE,
+        "enddatetime"   : END_DATE,
+        "sort"          : "datedesc"
+    }
+
+    for attempt in range(1, 4):  # retry up to 3 times
+        try:
+            response = requests.get(BASE_URL, params=params, timeout=30)
+
+            if response.status_code == 429:
+                wait = attempt * 30  # 30s → 60s → 90s
+                print(f"  ⚠️  Rate limited. Waiting {wait}s (retry {attempt}/3)...")
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            articles = data.get("articles", [])
+            print(f"  ✅ [{query_info['label']}] → {len(articles)} articles")
+            return articles
+
+        except requests.exceptions.RequestException as e:
+            print(f"  ❌ Attempt {attempt} failed: {e}")
+            time.sleep(15)
+
+    print(f"  ❌ [{query_info['label']}] → Skipped after 3 retries.")
+    return []
+
+# ─────────────────────────────────────────────
+# MAIN COLLECTOR
+# ─────────────────────────────────────────────
+def collect_all():
+    print("=" * 60)
+    print("  GDELT News Collector — Indian MSME Supply Chain")
+    print(f"  Date range : {START_DATE[:8]} → {END_DATE[:8]}")
+    print("=" * 60)
+
+    all_rows = []
+
+    for i, query_info in enumerate(QUERIES):
+        print(f"\n[{i+1}/{len(QUERIES)}] Fetching: {query_info['label']}")
+        articles = fetch_gdelt(query_info)
+
+        for article in articles:
+            all_rows.append({
+                "disruption_type" : query_info["disruption_type"],
+                "label"           : query_info["label"],
+                "title"           : article.get("title", ""),
+                "url"             : article.get("url", ""),
+                "source"          : article.get("domain", ""),
+                "published"       : article.get("seendate", ""),
+                "language"        : article.get("language", ""),
+            })
+
+        if i < len(QUERIES) - 1:
+            print(f"  ⏳ Waiting {SLEEP_SEC}s before next query...")
+            time.sleep(SLEEP_SEC)
+
+    # ── CLEAN & SAVE ──────────────────────────
+    df = pd.DataFrame(all_rows)
+    print(f"\n{'='*60}")
+    print(f"  Total fetched          : {len(df)}")
+
+    df = df[df["language"] == "English"]
+    print(f"  After English filter   : {len(df)}")
+
+    df = df.drop_duplicates(subset="title")
+    print(f"  After dedup            : {len(df)}")
+
+    df = df[df["title"].str.strip() != ""]
+    print(f"  After empty drop       : {len(df)}")
+
+    df["published"] = pd.to_datetime(df["published"], format="%Y%m%dT%H%M%SZ", errors="coerce")
+    df = df.sort_values("published", ascending=False)
+
+    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+    print(f"\n  ✅ Saved → {OUTPUT_FILE}")
+    print(f"  📊 Final dataset : {len(df)} articles")
+    print("=" * 60)
+
+    print("\n📋 Articles per disruption type:")
+    print(df["label"].value_counts().to_string())
+
+    return df
+
+if __name__ == "__main__":
+    df = collect_all()
+    print("\n✅ Done! Open gdelt_india_disruptions.csv for your dataset.")
